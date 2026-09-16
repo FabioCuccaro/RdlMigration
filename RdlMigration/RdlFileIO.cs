@@ -49,7 +49,7 @@ namespace RdlMigration
         /// <returns>all the report pathes in the folder. </returns>
         public string[] GetReportsInFolder(string folderPath)
         {
-            var catagoryItems = server.ListChildren(folderPath, false).Where(item => item.TypeName == SoapApiConstants.Report);
+            var catagoryItems = server.ListChildren(folderPath, true).Where(item => item.TypeName == SoapApiConstants.Report);
             var reportPaths = from report in catagoryItems select report.Path;
             return reportPaths.ToArray();
         }

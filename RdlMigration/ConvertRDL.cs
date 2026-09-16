@@ -86,6 +86,7 @@ namespace RdlMigration
             }
         }
 
+
         private void ConvertAndUploadReport(PowerBIClientWrapper powerBIClient, RdlFileIO rdlFileIO, string reportPath)
         {
             var reportName = Path.GetFileName(reportPath);
@@ -94,7 +95,7 @@ namespace RdlMigration
 
             if (powerBIClient.ExistReport(reportName))
             {
-                Trace($"CONFLICT : {reportName}  A report with the same name already exists in the workspace");
+                Trace($"CONFLICT : {reportName} A report with the same name already exists in the workspace");
             }
             else
             {
@@ -106,9 +107,13 @@ namespace RdlMigration
                     var convertedFile = ConvertFile(reportPath, report, dataSources, referenceDataSetMap);
                     SaveAndCopyStream(reportName, convertedFile, $"output\\{reportName}_convert.rdl");
 
-                    powerBIClient.UploadRDL(reportName + ReportFileExtension, convertedFile);
+                    // ═══ AGGIUNTO: calcola cartella target e creala nel workspace ═══
+                    string relativeFolderPath = GetRelativeFolderPath(reportPath, rootFolder);
+                    string folderId = powerBIClient.EnsureFolderExists(relativeFolderPath);
+                    powerBIClient.UploadRDL(reportName, convertedFile, folderId);
+                    // ═══ FINE AGGIUNTA ═══
 
-                    Trace($"SUCCESS : {reportName}  The file is successfully uploaded");
+                    Trace($"SUCCESS : {reportName} The file is successfully uploaded");
                 }
                 catch (HttpOperationException httpException)
                 {
@@ -123,19 +128,19 @@ namespace RdlMigration
                     {
                         if (returnedJsonStr.Count() != 1)
                         {
-                            Trace($"FAILED TO UPLOAD : {reportName} RequestId:{requestId} {httpException.Message}");
+                            Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {httpException.Message}");
                         }
                         else
                         {
                             string jsonString = returnedJsonStr.First();
                             var returnedJsonDetail = JObject.Parse(jsonString);
                             errorMessage = returnedJsonDetail["error"]?["code"]?.Value<string>() ?? jsonString;
-                            Trace($"FAILED TO UPLOAD :  {reportName} RequestId:{requestId} {errorMessage}");
+                            Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {errorMessage}");
                         }
                     }
                     else
                     {
-                        Trace($"FAILED TO UPLOAD : {reportName} RequestId:{requestId} {httpException.Message}");
+                        Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {httpException.Message}");
                     }
                 }
                 catch (Exception e)
@@ -143,6 +148,29 @@ namespace RdlMigration
                     Trace($"FAILED : {reportName} {e.Message}");
                 }
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ↓↓↓ METODO NUOVO - DEVE STARE QUI, DENTRO la classe ConvertRDL ↓↓↓
+        // ═══════════════════════════════════════════════════════════════
+        /// <summary>
+        /// Estrae il path relativo della cartella del report rispetto alla root.
+        /// </summary>
+        private static string GetRelativeFolderPath(string reportPath, string rootFolderPath)
+        {
+            string normalizedRoot = rootFolderPath.TrimEnd('/') + "/";
+
+            string relativePath = reportPath;
+            if (reportPath.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                relativePath = reportPath.Substring(normalizedRoot.Length);
+            }
+
+            int lastSlash = relativePath.LastIndexOf('/');
+            if (lastSlash <= 0)
+                return null;
+
+            return relativePath.Substring(0, lastSlash);
         }
 
         private void SaveAndCopyStream(string reportName, Stream stream, string filePath)
