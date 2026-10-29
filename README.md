@@ -54,7 +54,15 @@ This is set in the Reporting Services Configuration Manager under Web Service UR
 ![image](https://user-images.githubusercontent.com/52690905/62327114-9ae5ee00-b464-11e9-9bf1-0fe399bcd152.png)
 
 #### File Path: 
-This refers to the relative path to your file or folder on the report server. If the path references a file, the tool will convert and push only that individual file. If the path references a folder, the tool will convert and try to push all the report files within that folder. This would include any reports contained in the folder and would convert dependencies that might be located in other folders or subfolders (such as Shared DataSources and Shared DataSets). Report in subfolders will not be published.
+This refers to the relative path to your file or folder on the report server. If the path references a file, the tool will convert and push only that individual file. If the path references a folder, the tool will convert and try to push all the report files within that folder. This would include any reports contained in the folder and would convert dependencies that might be located in other folders or subfolders (such as Shared DataSources and Shared DataSets). Reports in subfolders are published too, and the same folder structure is created in the target workspace (see "Folder structure" below).
+
+#### Folder structure:
+When the file path references a folder, the tool reads its subfolders recursively and recreates them as folders in the target workspace, so `/Sales/Italy/Monthly` is published as `Italy/Monthly` inside the workspace. Notes:
+
+- Folders are created with the Fabric REST API (`/v1/workspaces/{id}/folders`, currently in preview). The registered app also needs the **Workspace.ReadWrite.All** delegated permission and the user needs the Contributor role (or higher) on the workspace.
+- "My Workspace" does not support folders: all reports are published to its root.
+- A report is skipped as CONFLICT only if a report with the same name already exists in the same target folder. Reports in the workspace root are compared with all the reports of the workspace, as before.
+- If a folder cannot be created, the reports that belong to it are logged as FAILED and are not uploaded to the root.
 
 #### Workspace Name:
 This is the name of the workspace you want to upload your files to. Surround the name with quotation marks if there’s  a space in the name. For example:

@@ -89,6 +89,7 @@ namespace RdlMigration
             public const string RedirectUrl = "urn:ietf:wg:oauth:2.0:oob";
             public const string AuthorityUri = "https://login.microsoftonline.com/common";
             public const string PowerBiApiUri = "https://api.powerbi.com";
+            public const string FabricApiUri = "https://api.fabric.microsoft.com";
         }
     }
 }

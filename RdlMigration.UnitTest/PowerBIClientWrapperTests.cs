@@ -40,7 +40,7 @@ namespace RdlMigration.UnitTest
             }
             catch (Exception e)
             {
-                Assert.IsTrue(e.Message == $"WORKSPACE {workspaceName} NOT FOUND.  Please make sure it is a valid workspace");
+                Assert.IsTrue(e.Message == $"WORKSPACE {workspaceName} NOT FOUND. Please make sure it is a valid workspace");
             }
         }
 
