@@ -5,14 +5,14 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
 using Microsoft.IdentityModel.Clients.ActiveDirectory;
 using Microsoft.PowerBI.Api.V2;
 using Microsoft.PowerBI.Api.V2.Models;
 using Microsoft.Rest;
-using System.Net.Http;                    // ← AGGIUNTO
-using System.Net.Http.Headers;            // ← AGGIUNTO
-using System.Text;                        // ← AGGIUNTO
-using Newtonsoft.Json.Linq;               // ← AGGIUNTO
+using Newtonsoft.Json.Linq;
 
 using static RdlMigration.ElementNameConstants;
 
@@ -28,15 +28,19 @@ namespace RdlMigration
         // the selected workspace. if null then means "My Workspace" is added.
         private Group workspace;
 
-        private HashSet<string> workspaceReports = new HashSet<string>();
-
         private PowerBIClient client;
         private IImportsOperations importClient;
         private IReportsOperations reportsClient;
         private IGroupsOperations groupsClient;
 
-        private string accessToken;                                          // ← AGGIUNTO
-        private Dictionary<string, string> folderCache = new Dictionary<string, string>(); // ← AGGIUNTO
+        // token kept for the REST calls the SDK does not cover (folders, import into a folder)
+        private string accessToken;
+
+        // folder path relative to the workspace root -> folder id
+        private Dictionary<string, string> folderCache = new Dictionary<string, string>();
+
+        // folder id (empty for the root) -> names of the reports already in that folder
+        private Dictionary<string, HashSet<string>> folderReports = new Dictionary<string, HashSet<string>>();
 
         public PowerBIClientWrapper(string workspaceName, string clientId)
         {
@@ -72,155 +76,108 @@ namespace RdlMigration
             return userAuthnResult;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // ↓↓↓ METODO MODIFICATO: aggiunto parametro subfolderObjectId ↓↓↓
-        // ═══════════════════════════════════════════════════════════════
-
         /// <summary>
-        /// Upload the report file stream to workspace, optionally into a folder.
+        /// Upload the report file stream to the workspace, optionally into a workspace folder.
         /// </summary>
-        /// <param name="fileName">The file name displayed after uploaded.</param>
+        /// <param name="fileName">The file name displayed after uploaded, including the .rdl extension.</param>
         /// <param name="file">The file stream itself.</param>
-        /// <param name="subfolderObjectId">Optional folder UUID. Null = root.</param>
+        /// <param name="subfolderObjectId">Optional id of the target workspace folder. Null means the workspace root.</param>
         /// <returns>true if success, false if conflict.</returns>
         public bool UploadRDL(string fileName, Stream file, string subfolderObjectId = null)
         {
-            if (!ExistReport(fileName))
+            if (!ExistReport(fileName, subfolderObjectId))
             {
                 if (workspace == null)
                 {
-                    // My Workspace - nessun supporto cartelle
+                    // "My Workspace" does not support folders
                     importClient.PostImportWithFile(file, fileName, ImportConflictHandlerMode.Abort);
                 }
                 else if (string.IsNullOrEmpty(subfolderObjectId))
                 {
-                    // Workspace specifico, root
-                    importClient.PostImportWithFileInGroup(
-                        workspace.Id, file, fileName, ImportConflictHandlerMode.Abort);
+                    importClient.PostImportWithFileInGroup(workspace.Id, file, fileName, ImportConflictHandlerMode.Abort);
                 }
                 else
                 {
-                    // Workspace specifico CON cartella → REST API diretta
+                    // the SDK does not expose subfolderObjectId, so call the REST API directly
                     UploadRDLToFolder(fileName, file, subfolderObjectId);
                 }
-                workspaceReports.Add(fileName);
+                GetFolderReports(subfolderObjectId).Add(Path.GetFileNameWithoutExtension(fileName));
                 return true;
             }
 
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════
-        // ↓↓↓ METODI NUOVI: upload in cartella + gestione cartelle ↓↓↓
-        // ═══════════════════════════════════════════════════════
-
         /// <summary>
-        /// Upload via REST API diretta per passare subfolderObjectId.
+        /// Creates the folder hierarchy in the workspace if needed and returns the id of the last folder.
+        /// For example "Italy/Sales" creates "Italy", then "Sales" inside "Italy".
         /// </summary>
-        private void UploadRDLToFolder(string fileName, Stream file, string subfolderObjectId)
-        {
-            string url = $"https://api.powerbi.com/v1.0/myorg/groups/{workspace.Id}/imports" +
-                         $"?datasetDisplayName={Uri.EscapeDataString(fileName)}" +
-                         $"&nameConflict=Abort" +
-                         $"&subfolderObjectId={subfolderObjectId}";
-
-            using (var httpClient = new HttpClient())
-            {
-                httpClient.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", accessToken);
-
-                var multipart = new MultipartFormDataContent();
-                var streamContent = new StreamContent(file);
-                streamContent.Headers.ContentType =
-                    new MediaTypeHeaderValue("application/octet-stream");
-                multipart.Add(streamContent, "file", fileName);
-
-                var response = httpClient.PostAsync(url, multipart).Result;
-                if (!response.IsSuccessStatusCode)
-                {
-                    string body = response.Content.ReadAsStringAsync().Result;
-                    throw new Exception(
-                        $"Failed to upload '{fileName}' to folder {subfolderObjectId}: " +
-                        $"{response.StatusCode} - {body}");
-                }
-            }
-        }
-
-        /// <summary>
-        /// Crea la gerarchia di cartelle nel workspace PBI e ritorna l'ID dell'ultima.
-        /// Es: relativePath = "Italy/Sales" → crea "Italy", poi "Sales" dentro "Italy".
-        /// </summary>
-        /// <param name="relativePath">Path relativo (es. "Italy/Sales"). Null = root.</param>
-        /// <returns>L'UUID della cartella foglia, o null se root.</returns>
+        /// <param name="relativePath">The folder path relative to the workspace root. Null means the root.</param>
+        /// <returns>The id of the leaf folder, or null for the root or "My Workspace".</returns>
         public string EnsureFolderExists(string relativePath)
         {
             if (string.IsNullOrWhiteSpace(relativePath) || workspace == null)
+            {
                 return null;
+            }
 
-            if (folderCache.ContainsKey(relativePath))
-                return folderCache[relativePath];
+            if (folderCache.TryGetValue(relativePath, out string cachedId))
+            {
+                return cachedId;
+            }
 
             string[] segments = relativePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
             string parentFolderId = null;
-            string cumulativePath = "";
+            string cumulativePath = string.Empty;
 
-            using (var httpClient = new HttpClient())
+            using (var httpClient = CreateHttpClient())
             {
-                httpClient.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", accessToken);
-
                 foreach (string segment in segments)
                 {
-                    cumulativePath = string.IsNullOrEmpty(cumulativePath)
-                        ? segment
-                        : cumulativePath + "/" + segment;
+                    cumulativePath = string.IsNullOrEmpty(cumulativePath) ? segment : cumulativePath + "/" + segment;
 
-                    if (folderCache.ContainsKey(cumulativePath))
+                    if (folderCache.TryGetValue(cumulativePath, out string existingId))
                     {
-                        parentFolderId = folderCache[cumulativePath];
+                        parentFolderId = existingId;
                         continue;
                     }
 
-                    // Crea la cartella
-                    string url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspace.Id}/folders";
+                    string url = $"{PowerBIWrapperConstants.FabricApiUri}/v1/workspaces/{workspace.Id}/folders";
                     var bodyObj = new JObject { ["displayName"] = segment };
                     if (parentFolderId != null)
-                        bodyObj["parentObjectId"] = parentFolderId;
-
-                    var content = new StringContent(bodyObj.ToString(), Encoding.UTF8, "application/json");
-                    var response = httpClient.PostAsync(url, content).Result;
-                    string responseBody = response.Content.ReadAsStringAsync().Result;
-
-
-                    if (response.IsSuccessStatusCode)
                     {
-                        var folderObj = JObject.Parse(responseBody);
-                        parentFolderId = folderObj["id"]?.ToString();
-                        Console.WriteLine($"FOLDER CREATED: '{cumulativePath}' → ID: {parentFolderId}");
-                    }
-                    else if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
-                    {
-                        Console.WriteLine($"FOLDER EXISTS: '{cumulativePath}' → recovering ID...");
-                        parentFolderId = FindExistingFolderId(httpClient, segment, parentFolderId);
-                        Console.WriteLine($"FOLDER FOUND: '{cumulativePath}' → ID: {parentFolderId}");
-                    }
-                    else
-                    {
-                        // ═══ LOGGING DETTAGLIATO ═══
-                        Console.WriteLine($"═══════════════════════════════════════════════");
-                        Console.WriteLine($"ERROR creating folder '{cumulativePath}'");
-                        Console.WriteLine($"  HTTP Status : {(int)response.StatusCode} {response.StatusCode}");
-                        Console.WriteLine($"  Reason      : {response.ReasonPhrase}");
-                        Console.WriteLine($"  URL         : https://api.fabric.microsoft.com/v1.0/myorg/groups/{workspace.Id}/folders");
-                        Console.WriteLine($"  Request Body: {bodyObj.ToString()}");
-                        Console.WriteLine($"  Response    : {responseBody}");
-                        Console.WriteLine($"═══════════════════════════════════════════════");
-                        return null;
+                        bodyObj["parentFolderId"] = parentFolderId;
                     }
 
+                    using (var content = new StringContent(bodyObj.ToString(), Encoding.UTF8, "application/json"))
+                    using (var response = httpClient.PostAsync(url, content).Result)
+                    {
+                        string responseBody = response.Content.ReadAsStringAsync().Result;
 
-                    if (parentFolderId != null)
-                        folderCache[cumulativePath] = parentFolderId;
+                        if (response.IsSuccessStatusCode)
+                        {
+                            parentFolderId = JObject.Parse(responseBody)["id"]?.ToString();
+                            Console.WriteLine($"FOLDER CREATED : '{cumulativePath}' ID: {parentFolderId}");
+                        }
+                        else if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+                        {
+                            parentFolderId = FindExistingFolderId(httpClient, segment, parentFolderId);
+                            Console.WriteLine($"FOLDER EXISTS : '{cumulativePath}' ID: {parentFolderId}");
+                        }
+                        else
+                        {
+                            throw new Exception(
+                                $"Failed to create folder '{cumulativePath}' at {url}: " +
+                                $"{(int)response.StatusCode} {response.StatusCode} - {responseBody}");
+                        }
+                    }
+
+                    if (parentFolderId == null)
+                    {
+                        throw new Exception($"Could not resolve the id of folder '{cumulativePath}' in the workspace");
+                    }
+
+                    folderCache[cumulativePath] = parentFolderId;
                 }
             }
 
@@ -228,48 +185,151 @@ namespace RdlMigration
         }
 
         /// <summary>
-        /// Cerca una cartella esistente per nome e parent.
+        /// if the workspace root contains a specific report.
+        /// </summary>
+        /// <param name="reportName">the name of the report.</param>
+        /// <returns>true if the report exists.</returns>
+        public bool ExistReport(string reportName)
+        {
+            return ExistReport(reportName, null);
+        }
+
+        /// <summary>
+        /// if a folder of the workspace contains a specific report.
+        /// </summary>
+        /// <param name="reportName">the name of the report.</param>
+        /// <param name="folderId">the id of the workspace folder. Null means the workspace root.</param>
+        /// <returns>true if the report exists.</returns>
+        public bool ExistReport(string reportName, string folderId)
+        {
+            return GetFolderReports(folderId).Contains(Path.GetFileNameWithoutExtension(reportName));
+        }
+
+        private void UploadRDLToFolder(string fileName, Stream file, string subfolderObjectId)
+        {
+            string url = $"{PowerBIWrapperConstants.PowerBiApiUri}/v1.0/myorg/groups/{workspace.Id}/imports" +
+                         $"?datasetDisplayName={Uri.EscapeDataString(fileName)}" +
+                         $"&nameConflict=Abort" +
+                         $"&subfolderObjectId={subfolderObjectId}";
+
+            using (var httpClient = CreateHttpClient())
+            using (var multipart = new MultipartFormDataContent())
+            {
+                var streamContent = new StreamContent(file);
+                streamContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                multipart.Add(streamContent, "file", fileName);
+
+                using (var response = httpClient.PostAsync(url, multipart).Result)
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        string body = response.Content.ReadAsStringAsync().Result;
+                        throw new Exception(
+                            $"Failed to upload '{fileName}' to folder {subfolderObjectId}: " +
+                            $"{(int)response.StatusCode} {response.StatusCode} - {body}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Looks up an existing folder by name and parent, following the continuation pages of the list.
         /// </summary>
         private string FindExistingFolderId(HttpClient httpClient, string folderName, string parentFolderId)
         {
-            string listUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{workspace.Id}/folders";
-            var listResponse = httpClient.GetAsync(listUrl).Result;
-            string listBody = listResponse.Content.ReadAsStringAsync().Result;
-            var parsed = JObject.Parse(listBody);
-            var folders = parsed["value"] as JArray;
-
-            if (folders != null)
+            string url = $"{PowerBIWrapperConstants.FabricApiUri}/v1/workspaces/{workspace.Id}/folders";
+            if (parentFolderId != null)
             {
-                foreach (var f in folders)
-                {
-                    bool nameMatch = f["displayName"]?.ToString() == folderName;
-                    bool parentMatch = parentFolderId == null
-                        ? f["parentObjectId"] == null || f["parentObjectId"].Type == JTokenType.Null
-                        : f["parentObjectId"]?.ToString() == parentFolderId;
+                url += $"?rootFolderId={parentFolderId}&recursive=false";
+            }
+            else
+            {
+                url += "?recursive=false";
+            }
 
-                    if (nameMatch && parentMatch)
-                        return f["id"]?.ToString();
+            foreach (var folder in GetAllPages(httpClient, url))
+            {
+                bool nameMatch = string.Equals(folder["displayName"]?.ToString(), folderName, StringComparison.OrdinalIgnoreCase);
+                var parentToken = folder["parentFolderId"];
+                bool parentMatch = parentFolderId == null
+                    ? parentToken == null || parentToken.Type == JTokenType.Null
+                    : parentToken?.ToString() == parentFolderId;
+
+                if (nameMatch && parentMatch)
+                {
+                    return folder["id"]?.ToString();
                 }
             }
+
             return null;
         }
 
-        // ═══════════════════════════════════════════════════════
-        // ↓↓↓ FINE METODI NUOVI ↓↓↓
-        // ═══════════════════════════════════════════════════════
-
         /// <summary>
-        /// if the default workspace contains a specific report.
+        /// Returns the names of the reports already in a folder. The root uses the report list read at start-up,
+        /// which covers the whole workspace; folders are read on first use from the Fabric items API.
         /// </summary>
-        public bool ExistReport(string reportName)
+        private HashSet<string> GetFolderReports(string folderId)
         {
-            return workspaceReports.Contains(Path.GetFileNameWithoutExtension(reportName));
+            string key = folderId ?? string.Empty;
+            if (!folderReports.TryGetValue(key, out HashSet<string> reports))
+            {
+                reports = new HashSet<string>();
+                if (folderId != null && workspace != null && accessToken != null)
+                {
+                    string url = $"{PowerBIWrapperConstants.FabricApiUri}/v1/workspaces/{workspace.Id}/items" +
+                                 $"?type=PaginatedReport&recursive=false&rootFolderId={folderId}";
+                    using (var httpClient = CreateHttpClient())
+                    {
+                        foreach (var item in GetAllPages(httpClient, url))
+                        {
+                            reports.Add(item["displayName"]?.ToString());
+                        }
+                    }
+                }
+                folderReports[key] = reports;
+            }
+
+            return reports;
+        }
+
+        private static IEnumerable<JToken> GetAllPages(HttpClient httpClient, string url)
+        {
+            while (!string.IsNullOrEmpty(url))
+            {
+                JObject page;
+                using (var response = httpClient.GetAsync(url).Result)
+                {
+                    string body = response.Content.ReadAsStringAsync().Result;
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        throw new Exception($"Request to {url} failed: {(int)response.StatusCode} {response.StatusCode} - {body}");
+                    }
+                    page = JObject.Parse(body);
+                }
+
+                if (page["value"] is JArray values)
+                {
+                    foreach (var value in values)
+                    {
+                        yield return value;
+                    }
+                }
+
+                url = page["continuationUri"]?.Type == JTokenType.String ? page["continuationUri"].ToString() : null;
+            }
+        }
+
+        private HttpClient CreateHttpClient()
+        {
+            var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            return httpClient;
         }
 
         private void InitializeClients()
         {
             AuthenticationResult result = DoInteractiveSignIn();
-            accessToken = result.AccessToken;  // ← AGGIUNTO: salva il token per le chiamate REST dirette
+            accessToken = result.AccessToken;
             client = new PowerBIClient(
                 new Uri(PowerBIWrapperConstants.PowerBiApiUri),
                 new TokenCredentials(result.AccessToken));
@@ -285,7 +345,7 @@ namespace RdlMigration
             {
                 workspace = null;
                 var reportNames = reportsClient.GetReports().Value.Select(report => report.Name);
-                workspaceReports = new HashSet<string>(reportNames);
+                folderReports[string.Empty] = new HashSet<string>(reportNames);
                 return null;
             }
             var workspaces = groupsClient.GetGroups().Value;
@@ -299,7 +359,7 @@ namespace RdlMigration
                         $"WORKSPACE {workspaceName} IS NOT A PREMIUM WORKSPACE. Only premium workspaces can upload reports");
                 }
                 var reportNames = reportsClient.GetReportsInGroup(workspace.Id).Value.Select(report => report.Name);
-                workspaceReports = new HashSet<string>(reportNames);
+                folderReports[string.Empty] = new HashSet<string>(reportNames);
                 return workspace;
             }
             else if (groups.Count() == 0)

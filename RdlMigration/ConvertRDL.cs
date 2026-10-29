@@ -86,89 +86,95 @@ namespace RdlMigration
             }
         }
 
-
         private void ConvertAndUploadReport(PowerBIClientWrapper powerBIClient, RdlFileIO rdlFileIO, string reportPath)
         {
             var reportName = Path.GetFileName(reportPath);
             var report = rdlFileIO.DownloadRdl(reportPath);
             SaveAndCopyStream(reportName, report, $"output\\{reportName}_original.rdl");
 
-            if (powerBIClient.ExistReport(reportName))
+            try
             {
-                Trace($"CONFLICT : {reportName} A report with the same name already exists in the workspace");
-            }
-            else
-            {
-                try
+                string relativeFolderPath = GetRelativeFolderPath(reportPath, rootFolder);
+                string folderId = powerBIClient.EnsureFolderExists(relativeFolderPath);
+                string targetName = string.IsNullOrEmpty(relativeFolderPath) ? reportName : $"{relativeFolderPath}/{reportName}";
+
+                if (powerBIClient.ExistReport(reportName, folderId))
                 {
-                    XElement[] dataSets = rdlFileIO.GetDataSets(reportPath, out Dictionary<KeyValuePair<string, string>, XElement> referenceDataSetMap);
-                    DataSource[] dataSources = rdlFileIO.GetUniqueDataSources(reportPath);
-
-                    var convertedFile = ConvertFile(reportPath, report, dataSources, referenceDataSetMap);
-                    SaveAndCopyStream(reportName, convertedFile, $"output\\{reportName}_convert.rdl");
-
-                    // ═══ AGGIUNTO: calcola cartella target e creala nel workspace ═══
-                    string relativeFolderPath = GetRelativeFolderPath(reportPath, rootFolder);
-                    string folderId = powerBIClient.EnsureFolderExists(relativeFolderPath);
-                    powerBIClient.UploadRDL(reportName, convertedFile, folderId);
-                    // ═══ FINE AGGIUNTA ═══
-
-                    Trace($"SUCCESS : {reportName} The file is successfully uploaded");
+                    Trace($"CONFLICT : {targetName} A report with the same name already exists in the workspace");
+                    return;
                 }
-                catch (HttpOperationException httpException)
-                {
-                    string errorMessage;
-                    string requestId = String.Empty;
-                    if (httpException?.Response?.Headers.ContainsKey("RequestId") == true)
-                    {
-                        requestId = httpException.Response.Headers["RequestId"].First();
-                    }
 
-                    if (httpException.Response.Headers.TryGetValue("X-PowerBI-Error-Details", out IEnumerable<string> returnedJsonStr))
-                    {
-                        if (returnedJsonStr.Count() != 1)
-                        {
-                            Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {httpException.Message}");
-                        }
-                        else
-                        {
-                            string jsonString = returnedJsonStr.First();
-                            var returnedJsonDetail = JObject.Parse(jsonString);
-                            errorMessage = returnedJsonDetail["error"]?["code"]?.Value<string>() ?? jsonString;
-                            Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {errorMessage}");
-                        }
-                    }
-                    else
+                XElement[] dataSets = rdlFileIO.GetDataSets(reportPath, out Dictionary<KeyValuePair<string, string>, XElement> referenceDataSetMap);
+                DataSource[] dataSources = rdlFileIO.GetUniqueDataSources(reportPath);
+
+                var convertedFile = ConvertFile(reportPath, report, dataSources, referenceDataSetMap);
+                SaveAndCopyStream(reportName, convertedFile, $"output\\{reportName}_convert.rdl");
+
+                // the Imports API requires the .rdl extension in the display name of paginated reports
+                var uploadName = reportName.EndsWith(ReportFileExtension, StringComparison.OrdinalIgnoreCase)
+                    ? reportName
+                    : reportName + ReportFileExtension;
+                powerBIClient.UploadRDL(uploadName, convertedFile, folderId);
+
+                Trace($"SUCCESS : {targetName} The file is successfully uploaded");
+            }
+            catch (HttpOperationException httpException)
+            {
+                string errorMessage;
+                string requestId = String.Empty;
+                if (httpException?.Response?.Headers.ContainsKey("RequestId") == true)
+                {
+                    requestId = httpException.Response.Headers["RequestId"].First();
+                }
+
+                if (httpException.Response.Headers.TryGetValue("X-PowerBI-Error-Details", out IEnumerable<string> returnedJsonStr))
+                {
+                    if (returnedJsonStr.Count() != 1)
                     {
                         Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {httpException.Message}");
                     }
+                    else
+                    {
+                        string jsonString = returnedJsonStr.First();
+                        var returnedJsonDetail = JObject.Parse(jsonString);
+                        errorMessage = returnedJsonDetail["error"]?["code"]?.Value<string>() ?? jsonString;
+                        Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {errorMessage}");
+                    }
                 }
-                catch (Exception e)
+                else
                 {
-                    Trace($"FAILED : {reportName} {e.Message}");
+                    Trace($"FAILED TO UPLOAD : {reportName} RequestId: {requestId} {httpException.Message}");
                 }
+            }
+            catch (Exception e)
+            {
+                Trace($"FAILED : {reportName} {e.Message}");
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // ↓↓↓ METODO NUOVO - DEVE STARE QUI, DENTRO la classe ConvertRDL ↓↓↓
-        // ═══════════════════════════════════════════════════════════════
         /// <summary>
-        /// Estrae il path relativo della cartella del report rispetto alla root.
+        /// Gets the folder of a report relative to the root folder being migrated.
         /// </summary>
+        /// <returns>the relative folder path, or null if the report is directly in the root or outside it.</returns>
         private static string GetRelativeFolderPath(string reportPath, string rootFolderPath)
         {
-            string normalizedRoot = rootFolderPath.TrimEnd('/') + "/";
-
-            string relativePath = reportPath;
-            if (reportPath.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrEmpty(rootFolderPath))
             {
-                relativePath = reportPath.Substring(normalizedRoot.Length);
+                return null;
             }
 
+            string normalizedRoot = rootFolderPath.TrimEnd('/') + "/";
+            if (!reportPath.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            string relativePath = reportPath.Substring(normalizedRoot.Length);
             int lastSlash = relativePath.LastIndexOf('/');
             if (lastSlash <= 0)
+            {
                 return null;
+            }
 
             return relativePath.Substring(0, lastSlash);
         }
